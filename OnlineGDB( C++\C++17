@@ -1,0 +1,191 @@
+#include <iostream>
+#include <fstream>
+#include <cmath>
+#include <vector>
+#include <cstdint>
+
+struct Vector3 {
+    double x, y, z;
+    Vector3(double x = 0, double y = 0, double z = 0) : x(x), y(y), z(z) {}
+    Vector3 operator+(const Vector3& v) const { return Vector3(x + v.x, y + v.y, z + v.z); }
+    Vector3 operator-(const Vector3& v) const { return Vector3(x - v.x, y - v.y, z - v.z); }
+    Vector3 operator*(double s) const { return Vector3(x * s, y * s, z * s); }
+    double length() const { return std::sqrt(x*x + y*y + z*z); }
+    Vector3 normalize() const { double l = length(); return l > 0 ? *this * (1.0 / l) : Vector3(0,0,0); }
+    double dot(const Vector3& v) const { return x*v.x + y*v.y + z*v.z; }
+};
+
+#pragma pack(push, 1)
+struct BMPHeader {
+    uint16_t fileType{0x4D42};
+    uint32_t fileSize{0};
+    uint16_t reserved1{0};
+    uint16_t reserved2{0};
+    uint32_t offsetData{54};
+    uint32_t size{40};
+    int32_t width{0};
+    int32_t height{0};
+    uint16_t planes{1};
+    uint16_t bitCount{24};
+    uint32_t compression{0};
+    uint32_t sizeImage{0};
+    int32_t xPixelsPerMeter{0};
+    int32_t yPixelsPerMeter{0};
+    uint32_t colorsUsed{0};
+    uint32_t colorsImportant{0};
+};
+#pragma pack(pop)
+
+const int WIDTH = 854;
+const int HEIGHT = 480;
+const int MAX_STEPS = 90;
+const double SURF_DIST = 0.01;
+const double MAX_DIST = 25000.0;
+
+// 1. Детерминированная матрица Эшера (Управляемый микро-шум)
+double EscherNoise(Vector3 p) {
+    double s = 0.07;
+    double n1 = std::sin(p.x * s) * std::cos(p.y * s) * std::sin(p.z * s);
+    double n2 = std::cos(p.x * s * 2.3) * std::sin(p.z * s * 2.3) * 0.5;
+    return n1 + n2;
+}
+
+// 2. Глобальный SDF + 100-км пещера + 64-байтный оператор разрушения Δ
+double GetDistanceAndPhysics(Vector3 p, Vector3& outMagField, double& outCraterFactor) {
+    double sdfPlanet = p.length() - 15000.0;
+    
+    // Осевой сплайн мега-пещеры
+    double tunnelX = std::sin(p.z * 0.0015) * 400.0;
+    double tunnelY = std::cos(p.z * 0.0012) * 300.0;
+    double caveRadius = 290.0 + std::sin(p.z * 0.004) * 70.0;
+    double sdfCave = Vector3(p.x - tunnelX, p.y - tunnelY, 0.0).length() - caveRadius;
+    
+    // Топологическая инверсия знака
+    double baseSDF = std::max(sdfPlanet, -sdfCave);
+    
+    // Затухание Эшера по градиенту расстояния
+    double damping = std::exp(-0.0005 * baseSDF * baseSDF);
+    double microDetails = EscherNoise(p) * 14.0 * damping;
+    double combinedSDF = baseSDF + microDetails;
+    
+    // 64-байтный оператор возмущения Δ (кратер на правой стене туннеля)
+    double impactZ = 1850.0;
+    double impactX = std::sin(impactZ * 0.0015) * 400.0 + 250.0;
+    double impactY = std::cos(impactZ * 0.0012) * 300.0 - 20.0;
+    Vector3 impactCenter(impactX, impactY, impactZ);
+    
+    double distToImpact = (p - impactCenter).length();
+    double deltaDestruction = 0.0;
+    outCraterFactor = 0.0;
+    
+    if (distToImpact < 180.0) {
+        deltaDestruction = 95.0 * std::exp(-(distToImpact * distToImpact) / (2.0 * 55.0 * 55.0));
+        outCraterFactor = std::exp(-(distToImpact * distToImpact) / (2.0 * 70.0 * 70.0));
+    }
+    
+    double finalSDF = combinedSDF + deltaDestruction;
+    
+    // Аналитическое магнитное поле Максвелла
+    outMagField = Vector3(
+        std::sin(p.y * 0.02 + p.z * 0.005),
+        std::cos(p.x * 0.02 - p.z * 0.005),
+        std::sin(p.z * 0.01)
+    );
+    
+    return finalSDF;
+}
+
+Vector3 CalculateNormal(Vector3 p) {
+    double eps = 0.05;
+    Vector3 m; double c;
+    double d = GetDistanceAndPhysics(p, m, c);
+    return Vector3(
+        GetDistanceAndPhysics(Vector3(p.x + eps, p.y, p.z), m, c) - d,
+        GetDistanceAndPhysics(Vector3(p.x, p.y + eps, p.z), m, c) - d,
+        GetDistanceAndPhysics(Vector3(p.x, p.y, p.z + eps), m, c) - d
+    ).normalize();
+}
+
+void SaveBMP(const char* filename, int width, int height, const std::vector<uint8_t>& rgbData) {
+    uint32_t rowSize = (width * 3 + 3) & ~3;
+    uint32_t dataSize = rowSize * height;
+    
+    BMPHeader header;
+    header.width = width;
+    header.height = -height;
+    header.sizeImage = dataSize;
+    header.fileSize = sizeof(BMPHeader) + dataSize;
+
+    std::ofstream file(filename, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    
+    std::vector<uint8_t> bgrData(dataSize, 0);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            int srcIdx = (y * width + x) * 3;
+            int dstIdx = y * rowSize + x * 3;
+            bgrData[dstIdx]     = rgbData[srcIdx + 2];
+            bgrData[dstIdx + 1] = rgbData[srcIdx + 1];
+            bgrData[dstIdx + 2] = rgbData[srcIdx];
+        }
+    }
+    file.write(reinterpret_cast<const char*>(bgrData.data()), bgrData.size());
+    file.close();
+}
+
+int main() {
+    std::cout << "Rendering Full-Frame Analytical Reality Showcase (854x480)..." << std::endl;
+    std::vector<uint8_t> image(WIDTH * HEIGHT * 3);
+    
+    // Камера строго по центру туннеля
+    double startZ = 1000.0;
+    Vector3 camPos(std::sin(startZ * 0.0015) * 400.0, std::cos(startZ * 0.0012) * 300.0, startZ);
+    Vector3 lightPos = camPos + Vector3(-50.0, 60.0, 300.0);
+
+    for (int y = 0; y < HEIGHT; ++y) {
+        for (int x = 0; x < WIDTH; ++x) {
+            double uvX = (x - WIDTH * 0.5) / HEIGHT;
+            double uvY = -(y - HEIGHT * 0.5) / HEIGHT;
+            
+            // Взгляд вдоль изгиба пещеры
+            Vector3 rayDir = Vector3(uvX + 0.08, uvY - 0.06, 1.0).normalize();
+            
+            double t = 0.0;
+            Vector3 p, magField;
+            double craterFactor = 0.0, d = 0.0;
+            
+            for (int step = 0; step < MAX_STEPS; ++step) {
+                p = camPos + rayDir * t;
+                d = GetDistanceAndPhysics(p, magField, craterFactor);
+                t += d * 0.85;
+                if (d < SURF_DIST || t > MAX_DIST) break;
+            }
+            
+            int idx = (y * WIDTH + x) * 3;
+            if (d < SURF_DIST) {
+                Vector3 normal = CalculateNormal(p);
+                Vector3 lightDir = (lightPos - p).normalize();
+                
+                double diff = std::max(0.18, normal.dot(lightDir));
+                double fog = std::exp(-t * 0.0004);
+                double magLine = std::pow(std::abs(std::sin(magField.x * 4.0 + magField.y * 4.0)), 8.0);
+                
+                double r = (115.0 * diff + craterFactor * 230.0) * fog + 15.0 * (1.0 - fog);
+                double g = (110.0 * diff + magLine * 170.0 + craterFactor * 85.0) * fog + 22.0 * (1.0 - fog);
+                double b = (120.0 * diff + magLine * 250.0) * fog + 38.0 * (1.0 - fog);
+                
+                image[idx]     = static_cast<uint8_t>(r < 0 ? 0 : (r > 255 ? 255 : r));
+                image[idx + 1] = static_cast<uint8_t>(g < 0 ? 0 : (g > 255 ? 255 : g));
+                image[idx + 2] = static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
+            } else {
+                image[idx]     = 15;
+                image[idx + 1] = 22;
+                image[idx + 2] = 38;
+            }
+        }
+    }
+    
+    SaveBMP("analytical_reality_full.bmp", WIDTH, HEIGHT, image);
+    std::cout << "Done! Full image saved to 'analytical_reality_full.bmp'." << std::endl;
+    return 0;
+}
